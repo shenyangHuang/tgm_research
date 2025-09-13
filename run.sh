@@ -12,4 +12,4 @@ module load python/3.10
 source $SCRATCH/my_venv/bin/activate
 pwd
 
-python realtg_tpnet.py --seed=1 --epochs=30 --device=cuda:0
+python realtg_tpnet.py --seed=1 --epochs=30 --device=cuda:0 --dataset=tgbl-wiki
