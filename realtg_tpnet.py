@@ -468,12 +468,13 @@ for epoch in range(1, args.epochs + 1):
             test_mrr, full_mrr_list, per_link_rows = eval_full(evaluator, test_loader, model, eval_metric, static_node_feat, test_edge_set=test_edge_set)
             print(f'Test MRR Full {eval_metric}={test_mrr:.4f}')   
 
-        try:
-            # store both metrics per link (your writer should accept 5 columns under the chosen field)
-            add_to_jsonl(per_link_rows, test_file, field_name="TPNet")
-            print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
-        except Exception as e:
-            print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
+        if (args.seed == 1):
+            try:
+                # store both metrics per link (your writer should accept 5 columns under the chosen field)
+                add_to_jsonl(per_link_rows, test_file, field_name="TPNet")
+                print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
+            except Exception as e:
+                print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
         
         # torch.save(model.state_dict(), 'best_model.pth')
         # print(f'\tBest model at epoch {epoch:02d} saved to best_model.pth')
