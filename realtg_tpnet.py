@@ -1,7 +1,7 @@
 import argparse
 import copy
 import time
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Set
 import os
 from utils.json_handler import load_edges_from_jsonl
 from utils.json_handler import add_to_jsonl
@@ -20,11 +20,38 @@ from tgm.hooks import (
     NegativeEdgeSamplerHook,
     RecencyNeighborHook,
     TGBNegativeEdgeSamplerHook,
-    FullNegativeHook,
 )
 from tgm.loader import DGDataLoader
 from tgm.nn import RandomProjectionModule, Time2Vec, TPNet
 from tgm.util.seed import seed_everything
+from tgm.hooks import StatelessHook
+
+
+class FullNegativeHook(StatelessHook):
+    """Negative Sampler Hook for full evaluation. 
+
+    Args:
+        full_dst (torch.Tensor): all possible destination nodes for evaluation
+    """
+    requires: Set[str] = set()
+    produces = {'neg', 'neg_time'}
+
+    def __init__(self, all_dst: torch.Tensor) -> None:
+        self.all_dst = all_dst
+
+    def __call__(self, dg: DGraph, batch: DGBatch) -> DGBatch:
+        batch.neg = self.all_dst.to(dg.device)  # type: ignore
+        gen = torch.Generator(device=dg.device)
+        gen.manual_seed(0)
+        batch.neg_time = torch.randint(  # type: ignore
+            int(batch.time.min().item()),
+            int(batch.time.max().item()) + 1,
+            (batch.neg.size(0),),  # type: ignore
+            device=dg.device,
+            generator=gen,
+        )
+        return batch
+
 
 parser = argparse.ArgumentParser(
     description='TPNet LinkPropPred Example',

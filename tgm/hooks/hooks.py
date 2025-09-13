@@ -98,34 +98,6 @@ class NegativeEdgeSamplerHook(StatelessHook):
         batch.neg_time = batch.time.clone()  # type: ignore
         return batch
     
-
-class FullNegativeHook(StatelessHook):
-    """Negative Sampler Hook for full evaluation. 
-
-    Args:
-        full_dst (torch.Tensor): all possible destination nodes for evaluation
-    """
-    requires: Set[str] = set()
-    produces = {'neg', 'neg_time'}
-
-    def __init__(self, all_dst: torch.Tensor) -> None:
-        self.all_dst = all_dst
-
-    def __call__(self, dg: DGraph, batch: DGBatch) -> DGBatch:
-        batch.neg = self.all_dst.to(dg.device)  # type: ignore
-        gen = torch.Generator(device=dg.device)
-        gen.manual_seed(0)
-        batch.neg_time = torch.randint(  # type: ignore
-            int(batch.time.min().item()),
-            int(batch.time.max().item()) + 1,
-            (batch.neg.size(0),),  # type: ignore
-            device=dg.device,
-            generator=gen,
-        )
-        return batch
-
-
-
 class TGBNegativeEdgeSamplerHook(StatelessHook):
     """Load data from DGraph using pre-generated TGB negative samples.
     Make sure to perform `dataset.load_val_ns()` or `dataset.load_test_ns()` before using this hook.
