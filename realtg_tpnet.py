@@ -99,7 +99,7 @@ parser.add_argument(
 parser.add_argument('--num-layers', type=int, default=2, help='number of model layers')
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
 parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
-parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+parser.add_argument('--epochs', type=int, default=30, help='number of epochs')
 
 
 class LinkPredictor(nn.Module):
@@ -450,38 +450,33 @@ model = TPNet_LinkPrediction(
 opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
 
 best_val_mrr = 0.0
-
 for epoch in range(1, args.epochs + 1):
     with hm.activate('train'):
         start_time = time.perf_counter()
         loss = train(train_loader, model, opt, static_node_feat)
         end_time = time.perf_counter()
         latency = end_time - start_time
-    # with hm.activate('val'):
-    #     val_mrr, _ = eval(evaluator, val_loader, model, eval_metric, static_node_feat)
-    #     print(
-    #         f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {eval_metric}={val_mrr:.4f}'
-    #     )
 
-    with hm.activate('test_full'):
+    with hm.activate('val'):
+        val_mrr, _ = eval(evaluator, val_loader, model, eval_metric, static_node_feat)
+        print(
+            f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {eval_metric}={val_mrr:.4f}'
+        )
+
+    if (val_mrr > best_val_mrr):
+        best_val_mrr = val_mrr
+        with hm.activate('test_full'):
             test_mrr, full_mrr_list, per_link_rows = eval_full(evaluator, test_loader, model, eval_metric, static_node_feat, test_edge_set=test_edge_set)
             print(f'Test MRR Full {eval_metric}={test_mrr:.4f}')   
 
-
-    # if (val_mrr > best_val_mrr):
-    #     best_val_mrr = val_mrr
-    #     with hm.activate('test_full'):
-    #         test_mrr, full_mrr_list, per_link_rows = eval_full(evaluator, test_loader, model, eval_metric, static_node_feat, test_edge_set=test_edge_set)
-    #         print(f'Test MRR Full {eval_metric}={test_mrr:.4f}')   
-
-    #     if (args.seed == 1):
-    #         try:
-    #             # store both metrics per link (your writer should accept 5 columns under the chosen field)
-    #             add_to_jsonl(per_link_rows, test_file, field_name="TPNet")
-    #             print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
-    #         except Exception as e:
-    #             print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
-        
+        if (args.seed == 1):
+            try:
+                # store both metrics per link (your writer should accept 5 columns under the chosen field)
+                add_to_jsonl(per_link_rows, test_file, field_name="TPNet")
+                print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
+            except Exception as e:
+                print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
+    
         # torch.save(model.state_dict(), 'best_model.pth')
         # print(f'\tBest model at epoch {epoch:02d} saved to best_model.pth')
 
