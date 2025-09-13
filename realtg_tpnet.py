@@ -252,12 +252,12 @@ def eval(
     model.eval()
     perf_list = []
     for batch in tqdm(loader):
+        copy_batch = copy.deepcopy(batch)
         for idx, neg_batch in enumerate(batch.neg_batch_list):
             if test_edge_set is not None:
                 # only evaluate on the edges in test_edge_set
                 if (int(batch.src[idx]), int(batch.dst[idx]), float(batch.time[idx])) not in test_edge_dict:
                     continue
-            copy_batch = copy.deepcopy(batch)
             copy_batch.src = batch.src[idx].unsqueeze(0)
             copy_batch.dst = batch.dst[idx].unsqueeze(0)
             copy_batch.time = batch.time[idx].unsqueeze(0)
@@ -308,11 +308,11 @@ def eval_full(
     per_link_rows = []
     
     for batch in tqdm(loader):
+        copy_batch = copy.deepcopy(batch)
         for idx in range(len(batch.src)):
             if (int(batch.src[idx]), int(batch.dst[idx]), float(batch.time[idx])) not in test_edge_dict:
                 continue
             valid_dst = batch.neg
-            copy_batch = copy.deepcopy(batch)
             copy_batch.src = batch.src[idx].unsqueeze(0)
             copy_batch.dst = batch.dst[idx].unsqueeze(0)
             copy_batch.time = batch.time[idx].unsqueeze(0)
