@@ -395,7 +395,7 @@ num_nodes = dgraph.num_nodes
 edge_feats_dim = dgraph.edge_feats_dim
 
 if dgraph.static_node_feats is not None:
-    static_node_feat = dgraph.static_node_feats
+    static_node_feat = dgraph.static_node_feats.to(args.device)
 else:
     static_node_feat = torch.randn((num_nodes, args.node_dim), device=args.device)
 
