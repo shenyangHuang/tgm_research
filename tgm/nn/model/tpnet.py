@@ -431,7 +431,6 @@ class TPNet(nn.Module):
         src = src.repeat(2)
         dst = dst.repeat(2)
         edge_time = edge_time.repeat(2)
-        neighbours = neighbours.to(self.device)
         neighbor_node_features = X[neighbours, :]
         neighbor_node_features[neighbours == PADDED_NODE_ID] = 0
 
