@@ -398,7 +398,7 @@ nbr_hook = RecencyNeighborHook(
     edge_feats_dim=edge_feats_dim,
 )
 
-hm = HookManager(keys=['train', 'val', 'test'])
+hm = HookManager(keys=['train', 'val', 'test', 'test_full'])
 hm.register_shared(nbr_hook)
 hm.register('train', NegativeEdgeSamplerHook(low=int(dst.min()), high=int(dst.max())))
 hm.register('val', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='val'))
