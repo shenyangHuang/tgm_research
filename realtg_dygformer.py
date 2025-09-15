@@ -22,10 +22,9 @@ from tgm.hooks import (
     TGBNegativeEdgeSamplerHook,
 )
 from tgm.loader import DGDataLoader
-from tgm.nn import RandomProjectionModule, Time2Vec, TPNet
+from tgm.nn import DyGFormer, Time2Vec
 from tgm.util.seed import seed_everything
 from tgm.hooks import StatelessHook
-
 
 class FullNegativeHook(StatelessHook):
     """Negative Sampler Hook for full evaluation. 
@@ -61,53 +60,44 @@ def test_edge_set2dict(test_edge_set):
         edge_dict[(src,dst,ts)] = i
     return edge_dict
 
+
 parser = argparse.ArgumentParser(
-    description='TPNet LinkPropPred Example',
+    description='DyGFormers TGB Example',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument('--seed', type=int, default=1337, help='random seed to use')
 parser.add_argument('--dataset', type=str, default='tgbl-wiki', help='Dataset name')
-parser.add_argument('--bsize', type=int, default=200, help='batch size')
 parser.add_argument('--device', type=str, default='cpu', help='torch device')
+parser.add_argument('--epochs', type=int, default=3, help='number of epochs')
+parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
 parser.add_argument(
-    '--num-neighbors',
+    '--max_sequence_length',
     type=int,
     default=32,
-    help='number of recency temporal neighbors of each node',
+    help='maximal length of the input sequence of each node',
 )
+parser.add_argument('--dropout', type=str, default=0.1, help='dropout rate')
+parser.add_argument('--time_dim', type=int, default=100, help='time encoding dimension')
+parser.add_argument('--embed_dim', type=int, default=172, help='attention dimension')
+parser.add_argument('--node_dim', type=int, default=128, help='embedding dimension')
 parser.add_argument(
-    '--rp-num-layers',
+    '--channel-embedding-dim',
     type=int,
-    default=2,
-    help='the number of layer of random projection module',
+    default=50,
+    help='dimension of each channel embedding',
+)
+parser.add_argument('--patch-size', type=int, default=1, help='patch size')
+parser.add_argument('--num_layers', type=int, default=2, help='number of model layers')
+parser.add_argument(
+    '--num_heads', type=int, default=2, help='number of heads used in attention layer'
 )
 parser.add_argument(
-    '--rp-time-decay-weight',
-    type=float,
-    default=0.000001,
-    help='the first weight of the time decay',
-)
-parser.add_argument(
-    '--enforce-dim',
+    '--num-channels',
     type=int,
-    default=None,
-    help='enforced dimension of random projections',
+    default=4,
+    help='number of channels used in attention layer',
 )
-parser.add_argument(
-    '--rp-dim-factor',
-    type=int,
-    default=10,
-    help='the dim factor of random feature w.r.t. the node num',
-)
-parser.add_argument('--node-dim', type=int, default=128, help='embedding dimension')
-parser.add_argument('--time-dim', type=int, default=100, help='time encoding dimension')
-parser.add_argument(
-    '--embed-dim', type=int, default=172, help='node representation dimension'
-)
-parser.add_argument('--num-layers', type=int, default=2, help='number of model layers')
-parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
-parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
-parser.add_argument('--epochs', type=int, default=30, help='number of epochs')
+parser.add_argument('--bsize', type=int, default=200, help='batch size')
 
 
 class LinkPredictor(nn.Module):
@@ -122,41 +112,44 @@ class LinkPredictor(nn.Module):
         return self.fc2(h).sigmoid().view(-1)
 
 
-class TPNet_LinkPrediction(nn.Module):
+class DyGFormer_LinkPrediction(nn.Module):
     def __init__(
         self,
         node_feat_dim: int,
         edge_feat_dim: int,
         time_feat_dim: int,
-        output_dim: int,
-        dropout: float,
-        num_layers: int,
-        num_neighbors: int,
-        random_projection_module: RandomProjectionModule | None = None,
-        device: str = 'cpu',
+        channel_embedding_dim: int,
+        output_dim: int = 172,
+        patch_size: int = 1,
+        num_layers: int = 2,
+        num_heads: int = 2,
+        dropout: float = 0.1,
+        max_input_sequence_length: int = 512,
+        num_channels: int = 4,
         time_encoder: Callable[..., nn.Module] = Time2Vec,
+        device: str = 'cpu',
     ) -> None:
         super().__init__()
-        self.encoder = TPNet(
-            node_feat_dim=node_feat_dim,
-            edge_feat_dim=edge_feat_dim,
-            time_feat_dim=time_feat_dim,
-            output_dim=output_dim,
-            dropout=dropout,
-            num_layers=num_layers,
-            num_neighbors=num_neighbors,
-            random_projections=random_projection_module,
-            device=device,
-            time_encoder=time_encoder,
+        self.encoder = DyGFormer(
+            node_feat_dim,
+            edge_feat_dim,
+            time_feat_dim,
+            channel_embedding_dim,
+            output_dim,
+            patch_size,
+            num_layers,
+            num_heads,
+            dropout,
+            max_input_sequence_length,
+            num_channels,
+            time_encoder,
+            device,
         )
-        self.rp_module = random_projection_module.to(device)
-        self.decoder = LinkPredictor(output_dim).to(
-            device
+        self.decoder = LinkPredictor(
+            output_dim
         )  # @TODO: Make encoder/decoder to be explicit
 
-    def forward(
-        self, batch: DGBatch, static_node_feat: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, batch: DGBatch) -> Tuple[torch.Tensor, torch.Tensor]:
         src = batch.src
         dst = batch.dst
         neg = batch.neg
@@ -170,7 +163,7 @@ class TPNet_LinkPrediction(nn.Module):
         # positive edge
         edge_idx_pos = torch.stack((src, dst), dim=0)
         z_src_pos, z_dst_pos = self.encoder(
-            static_node_feat,
+            STATIC_NODE_FEAT,
             edge_idx_pos,
             time,
             nbr_nids[: pos_batch_size * 2],
@@ -213,7 +206,7 @@ class TPNet_LinkPrediction(nn.Module):
 
         # negative edge
         z_src_neg, z_dst_neg = self.encoder(
-            static_node_feat,
+            STATIC_NODE_FEAT,
             edge_idx_neg,
             time,
             torch.cat([src_nbr_nids, neg_nbr_nids], dim=0),
@@ -221,7 +214,6 @@ class TPNet_LinkPrediction(nn.Module):
             torch.cat([src_nbr_feats, neg_nbr_feats], dim=0),
         )
         neg_out = self.decoder(z_src_neg, z_dst_neg)
-        self.rp_module.update(batch.src, batch.dst, time=batch.time)
 
         return pos_out, neg_out
 
@@ -230,13 +222,12 @@ def train(
     loader: DGDataLoader,
     model: nn.Module,
     opt: torch.optim.Optimizer,
-    static_node_feat: torch.Tensor,
 ) -> float:
     model.train()
     total_loss = 0
     for batch in tqdm(loader):
         opt.zero_grad()
-        pos_out, neg_out = model(batch, static_node_feat)
+        pos_out, neg_out = model(batch)
 
         loss = F.binary_cross_entropy(pos_out, torch.ones_like(pos_out))
         loss += F.binary_cross_entropy(neg_out, torch.zeros_like(neg_out))
@@ -245,13 +236,13 @@ def train(
         total_loss += float(loss)
     return total_loss
 
+
 @torch.no_grad()
 def eval(
     evaluator: Evaluator,
     loader: DGDataLoader,
     model: nn.Module,
     eval_metric: str,
-    static_node_feat: torch.Tensor,
     test_edge_set: np.ndarray = None,
 ) -> float:
     if test_edge_set is not None:
@@ -287,18 +278,18 @@ def eval(
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
-            pos_out, neg_out = model(copy_batch, static_node_feat)
+            pos_out, neg_out = model(copy_batch)
 
-            #! TGB MRR evaluation
             input_dict = {
                 'y_pred_pos': pos_out,
                 'y_pred_neg': neg_out,
                 'eval_metric': [eval_metric],
             }
+            perf_list.append(evaluator.eval(input_dict)[eval_metric])
 
-            tgb_mrr = float(evaluator.eval(input_dict)[eval_metric])
-            perf_list.append(tgb_mrr)
-    return float(np.mean(perf_list)), perf_list
+    return float(np.mean(perf_list))
+
+
 
 @torch.no_grad()
 def eval_full(
@@ -306,18 +297,16 @@ def eval_full(
     loader: DGDataLoader,
     model: nn.Module,
     eval_metric: str,
-    static_node_feat: torch.Tensor,
-    test_edge_set, 
+    test_edge_set: np.ndarray = None,
 ) -> float:
     test_edge_dict = test_edge_set2dict(test_edge_set)
 
     model.eval()
     perf_list = []
     per_link_rows = []
-    
     for batch in tqdm(loader):
         copy_batch = copy.deepcopy(batch)
-        for idx in range(len(batch.src)):
+        for idx, neg_batch in enumerate(batch.neg_batch_list):
             if (int(batch.src[idx]), int(batch.dst[idx]), float(batch.time[idx])) not in test_edge_dict:
                 continue
             valid_dst = batch.neg
@@ -344,7 +333,7 @@ def eval_full(
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
-            pos_out, neg_out = model(copy_batch, static_node_feat)
+            pos_out, neg_out = model(copy_batch)
 
             #! full MRR evaluation
             input_dict = {
@@ -361,9 +350,8 @@ def eval_full(
                     batch.time[idx].item(),
                     full_mrr,
                 ])
+
     return float(np.mean(perf_list)), perf_list, per_link_rows
-
-
 
 
 args = parser.parse_args()
@@ -380,83 +368,75 @@ dataset.load_test_ns()
 data = dataset.get_TemporalData()
 valid_dst = torch.unique(data.dst).to(args.device)
 
-
 dir_path ="../"
 test_file = os.path.join(dir_path + "Real-TG/test", args.dataset, "test.jsonl")
 test_edge_set = load_edges_from_jsonl(test_file)  # (1000, 3) these are the edges we want to record MRR for
 
 
-data = DGData.from_tgb(args.dataset)
-dgraph = DGraph(data)
 
-num_nodes = dgraph.num_nodes
-edge_feats_dim = dgraph.edge_feats_dim
-
-if dgraph.static_node_feats is not None:
-    static_node_feat = dgraph.static_node_feats.to(args.device)
-else:
-    static_node_feat = torch.randn((num_nodes, args.node_dim), device=args.device)
-
-train_data, val_data, test_data = data.split()
+full_data = DGData.from_tgb(args.dataset)
+full_graph = DGraph(full_data)
+num_nodes = full_graph.num_nodes
+edge_feats_dim = full_graph.edge_feats_dim
+train_data, val_data, test_data = full_data.split()
 
 train_dg = DGraph(train_data, device=args.device)
 val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
+if train_dg.static_node_feats is not None:
+    STATIC_NODE_FEAT = train_dg.static_node_feats.to(args.device)
+else:
+    STATIC_NODE_FEAT = torch.randn(
+        (test_dg.num_nodes, args.node_dim), device=args.device
+    )
+
 _, dst, _ = train_dg.edges
 nbr_hook = RecencyNeighborHook(
-    num_nbrs=[args.num_neighbors],
+    num_nbrs=[args.max_sequence_length - 1],  # 1 remaining for seed node itself
     num_nodes=num_nodes,
     edge_feats_dim=edge_feats_dim,
 )
 
-hm = HookManager(keys=['train', 'val', 'test', 'test_full'])
+hm = HookManager(keys=['train', 'val', 'test'])
+hm.register_shared(nbr_hook)
 hm.register('train', NegativeEdgeSamplerHook(low=int(dst.min()), high=int(dst.max())))
 hm.register('val', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='val'))
 hm.register('test', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='test'))
 hm.register('test_full', FullNegativeHook(valid_dst))
-hm.register_shared(nbr_hook)
+
 
 train_loader = DGDataLoader(train_dg, args.bsize, hook_manager=hm)
 val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)
 test_loader = DGDataLoader(test_dg, args.bsize, hook_manager=hm)
 
-random_projection_module = RandomProjectionModule(
-    num_nodes=num_nodes,
-    num_layer=args.rp_num_layers,
-    time_decay_weight=args.rp_time_decay_weight,
-    beginning_time=dgraph.start_time,
-    enforce_dim=args.enforce_dim,
-    num_edges=train_dg.num_edges,
-    dim_factor=args.rp_dim_factor,
-    device=args.device,
-)
-
-model = TPNet_LinkPrediction(
-    node_feat_dim=static_node_feat.shape[1],
+model = DyGFormer_LinkPrediction(
+    node_feat_dim=STATIC_NODE_FEAT.shape[1],
     edge_feat_dim=edge_feats_dim,
     time_feat_dim=args.time_dim,
+    channel_embedding_dim=args.channel_embedding_dim,
     output_dim=args.embed_dim,
+    max_input_sequence_length=args.max_sequence_length,
     dropout=args.dropout,
+    num_heads=args.num_heads,
+    num_channels=args.num_channels,
     num_layers=args.num_layers,
-    num_neighbors=args.num_neighbors,
-    random_projection_module=random_projection_module,
     device=args.device,
-    time_encoder=Time2Vec,
-)
+    patch_size=args.patch_size,
+).to(args.device)
 
 opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+
 
 best_val_mrr = 0.0
 for epoch in range(1, args.epochs + 1):
     with hm.activate('train'):
         start_time = time.perf_counter()
-        loss = train(train_loader, model, opt, static_node_feat)
+        loss = train(train_loader, model, opt)
         end_time = time.perf_counter()
         latency = end_time - start_time
-
     with hm.activate('val'):
-        val_mrr, _ = eval(evaluator, val_loader, model, eval_metric, static_node_feat)
+        val_mrr = eval(evaluator, val_loader, model, eval_metric)
         print(
             f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {eval_metric}={val_mrr:.4f}'
         )
@@ -474,17 +454,11 @@ for epoch in range(1, args.epochs + 1):
                 print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
             except Exception as e:
                 print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
-    
-        # torch.save(model.state_dict(), 'best_model.pth')
-        # print(f'\tBest model at epoch {epoch:02d} saved to best_model.pth')
 
     # Clear memory state between epochs, except last epoch
     if epoch < args.epochs:
         hm.reset_state()
-        model.rp_module.reset_random_projections() 
 
 # with hm.activate('test'):
-#     #! test only on the subset of edges in test_edge_set
-#     test_mrr = eval(evaluator, test_loader, model, eval_metric, static_node_feat, test_edge_set=test_edge_set, valid_dst=valid_dst)
+#     test_mrr = eval(evaluator, test_loader, model, eval_metric)
 #     print(f'Test MRR:{eval_metric}={test_mrr:.4f}')
-
