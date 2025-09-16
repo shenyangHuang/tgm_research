@@ -149,7 +149,7 @@ class DyGFormer_LinkPrediction(nn.Module):
             output_dim
         )  # @TODO: Make encoder/decoder to be explicit
 
-    def forward(self, batch: DGBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, batch: DGBatch, static_node_feat: torch.tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         src = batch.src
         dst = batch.dst
         neg = batch.neg
@@ -163,7 +163,7 @@ class DyGFormer_LinkPrediction(nn.Module):
         # positive edge
         edge_idx_pos = torch.stack((src, dst), dim=0)
         z_src_pos, z_dst_pos = self.encoder(
-            STATIC_NODE_FEAT,
+            static_node_feat,
             edge_idx_pos,
             time,
             nbr_nids[: pos_batch_size * 2],
@@ -206,7 +206,7 @@ class DyGFormer_LinkPrediction(nn.Module):
 
         # negative edge
         z_src_neg, z_dst_neg = self.encoder(
-            STATIC_NODE_FEAT,
+            static_node_feat,
             edge_idx_neg,
             time,
             torch.cat([src_nbr_nids, neg_nbr_nids], dim=0),
@@ -222,12 +222,13 @@ def train(
     loader: DGDataLoader,
     model: nn.Module,
     opt: torch.optim.Optimizer,
+    static_node_feat: torch.tensor,
 ) -> float:
     model.train()
     total_loss = 0
     for batch in tqdm(loader):
         opt.zero_grad()
-        pos_out, neg_out = model(batch)
+        pos_out, neg_out = model(batch, static_node_feat)
 
         loss = F.binary_cross_entropy(pos_out, torch.ones_like(pos_out))
         loss += F.binary_cross_entropy(neg_out, torch.zeros_like(neg_out))
@@ -243,6 +244,7 @@ def eval(
     loader: DGDataLoader,
     model: nn.Module,
     eval_metric: str,
+    static_node_feat: torch.tensor,
     test_edge_set: np.ndarray = None,
 ) -> float:
     if test_edge_set is not None:
@@ -278,7 +280,7 @@ def eval(
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
-            pos_out, neg_out = model(copy_batch)
+            pos_out, neg_out = model(copy_batch, static_node_feat)
 
             input_dict = {
                 'y_pred_pos': pos_out,
@@ -297,6 +299,7 @@ def eval_full(
     loader: DGDataLoader,
     model: nn.Module,
     eval_metric: str,
+    static_node_feat: torch.tensor,
     test_edge_set: np.ndarray = None,
 ) -> float:
     test_edge_dict = test_edge_set2dict(test_edge_set)
@@ -333,7 +336,7 @@ def eval_full(
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
-            pos_out, neg_out = model(copy_batch)
+            pos_out, neg_out = model(copy_batch, static_node_feat)
 
             #! full MRR evaluation
             input_dict = {
@@ -385,9 +388,9 @@ val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
 if train_dg.static_node_feats is not None:
-    STATIC_NODE_FEAT = train_dg.static_node_feats.to(args.device)
+    static_node_feat = train_dg.static_node_feats.to(args.device)
 else:
-    STATIC_NODE_FEAT = torch.randn(
+    static_node_feat = torch.randn(
         (test_dg.num_nodes, args.node_dim), device=args.device
     )
 
@@ -411,7 +414,7 @@ val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)
 test_loader = DGDataLoader(test_dg, args.bsize, hook_manager=hm)
 
 model = DyGFormer_LinkPrediction(
-    node_feat_dim=STATIC_NODE_FEAT.shape[1],
+    node_feat_dim=static_node_feat.shape[1],
     edge_feat_dim=edge_feats_dim,
     time_feat_dim=args.time_dim,
     channel_embedding_dim=args.channel_embedding_dim,
@@ -432,11 +435,11 @@ best_val_mrr = 0.0
 for epoch in range(1, args.epochs + 1):
     with hm.activate('train'):
         start_time = time.perf_counter()
-        loss = train(train_loader, model, opt)
+        loss = train(train_loader, model, opt, static_node_feat)
         end_time = time.perf_counter()
         latency = end_time - start_time
     with hm.activate('val'):
-        val_mrr = eval(evaluator, val_loader, model, eval_metric)
+        val_mrr = eval(evaluator, val_loader, model, eval_metric, static_node_feat)
         print(
             f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {eval_metric}={val_mrr:.4f}'
         )
