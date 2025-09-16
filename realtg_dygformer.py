@@ -309,7 +309,7 @@ def eval_full(
     per_link_rows = []
     for batch in tqdm(loader):
         copy_batch = copy.deepcopy(batch)
-        for idx, neg_batch in enumerate(batch.neg_batch_list):
+        for idx in range(len(batch.src)):
             if (int(batch.src[idx]), int(batch.dst[idx]), float(batch.time[idx])) not in test_edge_dict:
                 continue
             valid_dst = batch.neg
