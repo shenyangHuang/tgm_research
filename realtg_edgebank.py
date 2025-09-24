@@ -138,7 +138,7 @@ dataset.load_val_ns()
 dataset.load_test_ns()
 
 data = dataset.get_TemporalData()
-valid_dst = torch.unique(data.dst).to(args.device)
+valid_dst = torch.unique(data.dst)
 
 dir_path ="../"
 test_file = os.path.join(dir_path + "Real-TG/test", args.dataset, "test.jsonl")
