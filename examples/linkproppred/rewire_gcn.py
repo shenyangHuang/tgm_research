@@ -41,7 +41,7 @@ parser.add_argument('--bsize', type=int, default=200, help='batch size')
 parser.add_argument(
     '--snapshot-time-gran',
     type=str,
-    default='D',
+    default='h',
     help='time granularity to operate on for snapshots',
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="now using wandb")
