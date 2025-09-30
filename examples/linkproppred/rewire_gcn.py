@@ -278,6 +278,7 @@ if args.wandb:
         "time granularity": args.snapshot_time_gran,
         "epochs": args.epochs,
         "embed_dim": args.embed_dim,
+        "task": "link prop pred",
         }
     )
 
