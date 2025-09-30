@@ -1,29 +1,28 @@
-r"""python rewire_gcn.py --epochs=100 --device=cuda:0
+r"""python -u gcn_rewired.py --epochs=100 --device=cuda:0
 """
 import argparse
 import time
 from typing import Tuple
 import os
-import wandb
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tgb.linkproppred.evaluate import Evaluator
+from tgb.nodeproppred.evaluate import Evaluator
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
-from tgm import DGBatch, DGData, DGraph, RecipeRegistry
-from tgm.constants import METRIC_TGB_LINKPROPPRED, RECIPE_TGB_LINK_PRED
+from tgm import DGBatch, DGData, DGraph
+from tgm.constants import METRIC_TGB_NODEPROPPRED
 from tgm.loader import DGDataLoader
-from tgm.timedelta import TimeDeltaDG
 from tgm.util.seed import seed_everything
+
 from cayley_construction import batched_augment_cayley, build_cayley_bank
 
 
 parser = argparse.ArgumentParser(
-    description='GCN LinkPropPred Example',
+    description='GCN NodePropPred Example',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument('--seed', type=int, default=1337, help='random seed to use')
@@ -37,14 +36,12 @@ parser.add_argument('--embed-dim', type=int, default=128, help='embedding dimens
 parser.add_argument(
     '--node-dim', type=int, default=256, help='node feat dimension if not provided'
 )
-parser.add_argument('--bsize', type=int, default=200, help='batch size')
 parser.add_argument(
     '--snapshot-time-gran',
     type=str,
     default='D',
     help='time granularity to operate on for snapshots',
 )
-parser.add_argument("--wandb", action="store_true", default=False, help="now using wandb")
 
 
 class RewiredGCN(nn.Module):
@@ -162,18 +159,16 @@ class GCNEncoder(torch.nn.Module):
         x = self.convs[-1](x, edge_index)
         return x
 
-
-class LinkPredictor(nn.Module):
-    def __init__(self, dim: int) -> None:
+class NodePredictor(torch.nn.Module):
+    def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(2 * dim, dim)
-        self.fc2 = nn.Linear(dim, 1)
+        self.fc1 = nn.Linear(in_dim, in_dim)
+        self.fc2 = nn.Linear(in_dim, out_dim)
 
-    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(torch.cat([z_src, z_dst], dim=1))
+    def forward(self, z_node: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(z_node)
         h = h.relu()
-        return self.fc2(h).view(-1)
-    
+        return self.fc2(h)
 
 def train(
     loader: DGDataLoader,
@@ -265,23 +260,8 @@ def eval(
 args = parser.parse_args()
 seed_everything(args.seed)
 
-if args.wandb:
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="rewiring",
-        
-        # track hyperparameters and run metadata
-        config={
-        "learning_rate": args.lr,
-        "architecture": "gcn_rewired",
-        "dataset": args.dataset,
-        "time granularity": args.snapshot_time_gran,
-        "epochs": args.epochs,
-        "embed_dim": args.embed_dim,
-        }
-    )
-
 evaluator = Evaluator(name=args.dataset)
+
 
 train_data, val_data, test_data = DGData.from_tgb(args.dataset).split()
 train_dg = DGraph(train_data, device=args.device)
@@ -342,7 +322,8 @@ else:
     torch.save(cayley_g, cache_path)  # Save to disk
     print('Cayley graph cached at, ', cache_path)
 
-    
+
+
 encoder = RewiredGCN(
     in_channels=static_node_feats.shape[1],
     embed_dim=args.embed_dim,
@@ -370,10 +351,10 @@ for epoch in range(1, args.epochs + 1):
         )
         end_time = time.perf_counter()
         latency = end_time - start_time
+        print(f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f}')
 
 
     with hm.activate(val_key):
-        start_time = time.perf_counter()
         val_mrr = eval(
             val_loader,
             val_snapshots_loader,
@@ -385,19 +366,11 @@ for epoch in range(1, args.epochs + 1):
             conversion_rate,
             cayley_g,
         )
-        end_time = time.perf_counter()
-        val_latency = end_time - start_time
         print(
-        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} val_latency={val_latency:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
+        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
     )
-        
-    if (args.wandb):
-        wandb.log({"train_loss":loss,
-                    "val_" + METRIC_TGB_LINKPROPPRED: val_mrr,
-                    "train latency": latency,
-                    "val latency": val_latency,
-                    })
-    
+
+
 with hm.activate(test_key):
     test_mrr = eval(
         test_loader,
