@@ -36,6 +36,7 @@ parser.add_argument(
     default='Y',
     help='time granularity to operate on for snapshots',
 )
+parser.add_argument("--wandb", action="store_true", default=False, help="now using wandb")
 
 
 class GCNEncoder(torch.nn.Module):
