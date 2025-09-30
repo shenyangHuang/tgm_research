@@ -174,6 +174,7 @@ def train(
     encoder: nn.Module,
     decoder: nn.Module,
     opt: torch.optim.Optimizer,
+    expander_edge_index: torch.Tensor = None,
 ) -> float:
     encoder.train()
     decoder.train()
@@ -185,7 +186,7 @@ def train(
         if y_true is None:
             continue
 
-        z = encoder(batch, static_node_feats)
+        z = encoder(batch, static_node_feats, expander_edge_index)
         z_node = z[batch.node_ids]
         y_pred = decoder(z_node)
 
@@ -196,49 +197,34 @@ def train(
 
     return total_loss
 
-
-
-
 @torch.no_grad()
 def eval(
     loader: DGDataLoader,
-    snapshots_loader: DGDataLoader,
     static_node_feats: torch.Tensor,
-    z: torch.Tensor,
     encoder: nn.Module,
     decoder: nn.Module,
     evaluator: Evaluator,
-    conversion_rate: int,
-    expander_edge_index: torch.Tensor,
+    expander_edge_index: torch.Tensor = None,
 ) -> float:
     encoder.eval()
     decoder.eval()
     perf_list = []
 
-    snapshots_iterator = iter(snapshots_loader)
-    snapshot_batch = next(snapshots_iterator)
-
     for batch in tqdm(loader):
-        neg_batch_list = batch.neg_batch_list
-        for idx, neg_batch in enumerate(neg_batch_list):
-            query_src = batch.src[idx].repeat(len(neg_batch) + 1)
-            query_dst = torch.cat([batch.dst[idx].unsqueeze(0), neg_batch])
+        y_true = batch.dynamic_node_feats
+        if y_true is None:
+            continue
 
-            y_pred = decoder(z[query_src], z[query_dst]).sigmoid()
-            input_dict = {
-                'y_pred_pos': y_pred[0],
-                'y_pred_neg': y_pred[1:],
-                'eval_metric': [METRIC_TGB_LINKPROPPRED],
-            }
-            perf_list.append(evaluator.eval(input_dict)[METRIC_TGB_LINKPROPPRED])
+        z = encoder(batch, static_node_feats, expander_edge_index)
+        z_node = z[batch.node_ids]
+        y_pred = decoder(z_node)
 
-        # update the model if the prediction batch has moved to next snapshot.
-        while batch.time[-1] > (snapshot_batch.time[-1] + 1) * conversion_rate:
-            try:
-                snapshot_batch = next(snapshots_iterator)
-                z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
-            except StopIteration:
-                pass
+        input_dict = {
+            'y_true': y_true,
+            'y_pred': y_pred,
+            'eval_metric': [METRIC_TGB_NODEPROPPRED],
+        }
+        perf_list.append(evaluator.eval(input_dict)[METRIC_TGB_NODEPROPPRED])
 
     return float(np.mean(perf_list))
 
@@ -296,45 +282,20 @@ opt = torch.optim.Adam(
     set(encoder.parameters()) | set(decoder.parameters()), lr=float(args.lr)
 )
 
-
 """
-#! continue debug here!
+#! add wandb logging
 """
 
 for epoch in range(1, args.epochs + 1):
     start_time = time.perf_counter()
-    loss = train(train_loader, static_node_feats, encoder, decoder, opt)
+    loss = train(train_loader, static_node_feats, encoder, decoder, opt, cayley_g)
     end_time = time.perf_counter()
     latency = end_time - start_time
-
-
-    with hm.activate(val_key):
-        val_mrr = eval(
-            val_loader,
-            val_snapshots_loader,
-            static_node_feats,
-            z,
-            encoder,
-            decoder,
-            evaluator,
-            conversion_rate,
-            cayley_g,
-        )
-        print(
-        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
+    
+    val_ndcg = eval(val_loader, static_node_feats, encoder, decoder, evaluator, cayley_g)
+    print(
+        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_NODEPROPPRED}={val_ndcg:.4f}'
     )
 
-
-with hm.activate(test_key):
-    test_mrr = eval(
-        test_loader,
-        test_snapshots_loader,
-        static_node_feats,
-        z,
-        encoder,
-        decoder,
-        evaluator,
-        conversion_rate,
-        cayley_g,
-    )
-    print(f'Test {METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')
+test_ndcg = eval(test_loader, static_node_feats, encoder, decoder, evaluator, cayley_g)
+print(f'Test {METRIC_TGB_NODEPROPPRED}={test_ndcg:.4f}')
