@@ -1,5 +1,6 @@
 import argparse
 import time
+import wandb
 
 import numpy as np
 import torch
@@ -153,6 +154,23 @@ def eval(
 args = parser.parse_args()
 seed_everything(args.seed)
 
+if args.wandb:
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="rewiring",
+        
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": args.lr,
+        "architecture": "gcn",
+        "dataset": args.dataset,
+        "time granularity": args.snapshot_time_gran,
+        "epochs": args.epochs,
+        "embed_dim": args.embed_dim,
+        "task": "node prop pred",
+        }
+    )
+
 train_data, val_data, test_data = DGData.from_tgb(args.dataset).split()
 train_dg = DGraph(train_data, device=args.device)
 val_dg = DGraph(val_data, device=args.device)
@@ -190,10 +208,20 @@ for epoch in range(1, args.epochs + 1):
     end_time = time.perf_counter()
     latency = end_time - start_time
 
+    start_time = time.perf_counter()
     val_ndcg = eval(val_loader, static_node_feats, encoder, decoder, evaluator)
     print(
         f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_NODEPROPPRED}={val_ndcg:.4f}'
     )
+    end_time = time.perf_counter()
+    val_latency = end_time - start_time
+
+    if (args.wandb):
+        wandb.log({"train_loss":loss,
+                    "val_" + METRIC_TGB_NODEPROPPRED: val_ndcg,
+                    "train latency": latency,
+                    "val latency": val_latency,
+                    })
 
 test_ndcg = eval(test_loader, static_node_feats, encoder, decoder, evaluator)
 print(f'Test {METRIC_TGB_NODEPROPPRED}={test_ndcg:.4f}')
