@@ -17,18 +17,16 @@ from tgm import DGBatch, DGData, DGraph
 from tgm.constants import METRIC_TGB_NODEPROPPRED
 from tgm.loader import DGDataLoader
 from tgm.util.seed import seed_everything
-
 from cayley_construction import batched_augment_cayley, build_cayley_bank
-
 
 parser = argparse.ArgumentParser(
     description='GCN NodePropPred Example',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument('--seed', type=int, default=1337, help='random seed to use')
-parser.add_argument('--dataset', type=str, default='tgbl-wiki', help='Dataset name')
+parser.add_argument('--dataset', type=str, default='tgbn-trade', help='Dataset name')
 parser.add_argument('--device', type=str, default='cpu', help='torch device')
-parser.add_argument('--epochs', type=int, default=15, help='number of epochs')
+parser.add_argument('--epochs', type=int, default=50, help='number of epochs')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--dropout', type=str, default=0.1, help='dropout rate')
 parser.add_argument('--n-layers', type=int, default=2, help='number of GCN layers')
@@ -39,7 +37,7 @@ parser.add_argument(
 parser.add_argument(
     '--snapshot-time-gran',
     type=str,
-    default='D',
+    default='Y',
     help='time granularity to operate on for snapshots',
 )
 
@@ -172,45 +170,32 @@ class NodePredictor(torch.nn.Module):
 
 def train(
     loader: DGDataLoader,
-    snapshots_loader: DGDataLoader,
     static_node_feats: torch.Tensor,
     encoder: nn.Module,
     decoder: nn.Module,
     opt: torch.optim.Optimizer,
-    conversion_rate: int,
-    expander_edge_index: torch.Tensor,
-) -> Tuple[float, torch.Tensor]:
+) -> float:
     encoder.train()
     decoder.train()
     total_loss = 0
 
-    snapshots_iterator = iter(snapshots_loader)
-    snapshot_batch = next(snapshots_iterator)
-    z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
-    z = z.detach()
-
     for batch in tqdm(loader):
         opt.zero_grad()
+        y_true = batch.dynamic_node_feats
+        if y_true is None:
+            continue
 
-        pos_out = decoder(z[batch.src], z[batch.dst])
-        neg_out = decoder(z[batch.src], z[batch.neg])
+        z = encoder(batch, static_node_feats)
+        z_node = z[batch.node_ids]
+        y_pred = decoder(z_node)
 
-        loss = F.binary_cross_entropy_with_logits(pos_out, torch.ones_like(pos_out))
-        loss += F.binary_cross_entropy_with_logits(neg_out, torch.zeros_like(neg_out))
+        loss = F.cross_entropy(y_pred, y_true)
         loss.backward()
         opt.step()
-        total_loss += float(loss) / batch.src.shape[0]
+        total_loss += float(loss)
 
-        # update the model if the prediction batch has moved to next snapshot.
-        while batch.time[-1] > (snapshot_batch.time[-1] + 1) * conversion_rate:
-            try:
-                snapshot_batch = next(snapshots_iterator)
-                z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
-                z = z.detach()
-            except StopIteration:
-                pass
+    return total_loss
 
-    return total_loss, z
 
 
 
@@ -260,41 +245,14 @@ def eval(
 args = parser.parse_args()
 seed_everything(args.seed)
 
-evaluator = Evaluator(name=args.dataset)
-
-
 train_data, val_data, test_data = DGData.from_tgb(args.dataset).split()
 train_dg = DGraph(train_data, device=args.device)
 val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
-snapshot_td = TimeDeltaDG(args.snapshot_time_gran)
-conversion_rate = int(snapshot_td.convert(train_dg.time_delta))
-
-train_data_discretized = train_data.discretize(args.snapshot_time_gran)
-val_data_discretized = val_data.discretize(args.snapshot_time_gran)
-test_data_discretized = test_data.discretize(args.snapshot_time_gran)
-
-
-train_snapshots = DGraph(train_data_discretized, device=args.device)
-val_snapshots = DGraph(val_data_discretized, device=args.device)
-test_snapshots = DGraph(test_data_discretized, device=args.device)
-
-hm = RecipeRegistry.build(
-    RECIPE_TGB_LINK_PRED, dataset_name=args.dataset, train_dg=train_dg
-)
-train_key, val_key, test_key = hm.keys
-
-train_loader = DGDataLoader(train_dg, args.bsize, hook_manager=hm)
-val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)
-test_loader = DGDataLoader(test_dg, args.bsize, hook_manager=hm)
-
-train_snapshots_loader = DGDataLoader(
-    train_snapshots, batch_unit=args.snapshot_time_gran
-)
-val_snapshots_loader = DGDataLoader(val_snapshots, batch_unit=args.snapshot_time_gran)
-test_snapshots_loader = DGDataLoader(test_snapshots, batch_unit=args.snapshot_time_gran)
-
+train_loader = DGDataLoader(train_dg, batch_unit=args.snapshot_time_gran)
+val_loader = DGDataLoader(val_dg, batch_unit=args.snapshot_time_gran)
+test_loader = DGDataLoader(test_dg, batch_unit=args.snapshot_time_gran)
 
 if train_dg.static_node_feats is not None:
     static_node_feats = train_dg.static_node_feats
@@ -303,6 +261,8 @@ else:
         (test_dg.num_nodes, args.node_dim), device=args.device
     )
 
+evaluator = Evaluator(name=args.dataset)
+num_classes = train_dg.dynamic_node_feats_dim
 
 #! load cached cayley graph if possible
 cache_path = f'cayley_{args.dataset}.pt'
@@ -331,27 +291,21 @@ encoder = RewiredGCN(
     num_layers=args.n_layers,
     dropout=float(args.dropout),
 ).to(args.device)
-decoder = LinkPredictor(args.embed_dim).to(args.device)
+decoder = NodePredictor(in_dim=args.embed_dim, out_dim=num_classes).to(args.device)
 opt = torch.optim.Adam(
     set(encoder.parameters()) | set(decoder.parameters()), lr=float(args.lr)
 )
 
+
+"""
+#! continue debug here!
+"""
+
 for epoch in range(1, args.epochs + 1):
-    with hm.activate(train_key):
-        start_time = time.perf_counter()
-        loss, z = train(
-            train_loader,
-            train_snapshots_loader,
-            static_node_feats,
-            encoder,
-            decoder,
-            opt,
-            conversion_rate,
-            cayley_g,
-        )
-        end_time = time.perf_counter()
-        latency = end_time - start_time
-        print(f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f}')
+    start_time = time.perf_counter()
+    loss = train(train_loader, static_node_feats, encoder, decoder, opt)
+    end_time = time.perf_counter()
+    latency = end_time - start_time
 
 
     with hm.activate(val_key):
