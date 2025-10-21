@@ -102,7 +102,7 @@ def train(
     encoder.train()
     decoder.train()
     total_loss = 0
-
+    perf_list = []
     for batch in tqdm(loader):
         opt.zero_grad()
         y_true = batch.dynamic_node_feats
@@ -113,12 +113,20 @@ def train(
         z_node = z[batch.node_ids]
         y_pred = decoder(z_node)
 
+        # compute train NDCG as well
+        input_dict = {
+            'y_true': y_true,
+            'y_pred': y_pred,
+            'eval_metric': [METRIC_TGB_NODEPROPPRED],
+        }
+        perf_list.append(evaluator.eval(input_dict)[METRIC_TGB_NODEPROPPRED])
+
         loss = F.cross_entropy(y_pred, y_true)
         loss.backward()
         opt.step()
         total_loss += float(loss)
 
-    return total_loss
+    return total_loss, float(np.mean(perf_list))
 
 
 @torch.no_grad()
@@ -205,20 +213,21 @@ opt = torch.optim.Adam(
 
 for epoch in range(1, args.epochs + 1):
     start_time = time.perf_counter()
-    loss = train(train_loader, static_node_feats, encoder, decoder, opt)
+    loss, train_NDCG = train(train_loader, static_node_feats, encoder, decoder, opt)
     end_time = time.perf_counter()
     latency = end_time - start_time
 
     start_time = time.perf_counter()
     val_ndcg = eval(val_loader, static_node_feats, encoder, decoder, evaluator)
     print(
-        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_NODEPROPPRED}={val_ndcg:.4f}'
+        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Train {METRIC_TGB_NODEPROPPRED}={train_NDCG:.4f} Validation {METRIC_TGB_NODEPROPPRED}={val_ndcg:.4f}'
     )
     end_time = time.perf_counter()
     val_latency = end_time - start_time
 
     if (args.wandb):
         wandb.log({"train_loss":loss,
+                   "train_" + METRIC_TGB_NODEPROPPRED: train_NDCG,
                     "val_" + METRIC_TGB_NODEPROPPRED: val_ndcg,
                     "train latency": latency,
                     "val latency": val_latency,
