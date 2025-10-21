@@ -1,7 +1,7 @@
 import argparse
-import time
 from typing import Tuple
 import wandb
+import time
 
 import numpy as np
 import torch
@@ -11,10 +11,12 @@ from tgb.linkproppred.evaluate import Evaluator
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
-from tgm import DGBatch, DGData, DGraph, RecipeRegistry
+from tgm import DGBatch, DGraph, TimeDeltaDG
 from tgm.constants import METRIC_TGB_LINKPROPPRED, RECIPE_TGB_LINK_PRED
-from tgm.loader import DGDataLoader
-from tgm.timedelta import TimeDeltaDG
+from tgm.data import DGData, DGDataLoader
+from tgm.hooks import RecipeRegistry
+from tgm.nn import LinkPredictor
+from tgm.util.logging import enable_logging, log_gpu, log_latency, log_metric
 from tgm.util.seed import seed_everything
 
 parser = argparse.ArgumentParser(
@@ -40,6 +42,12 @@ parser.add_argument(
     help='time granularity to operate on for snapshots',
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="now using wandb")
+parser.add_argument(
+    '--log-file-path', type=str, default=None, help='Optional path to write logs'
+)
+
+args = parser.parse_args()
+enable_logging(log_file_path=args.log_file_path)
 
 
 class GCNEncoder(torch.nn.Module):
@@ -83,18 +91,8 @@ class GCNEncoder(torch.nn.Module):
         return x
 
 
-class LinkPredictor(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(2 * dim, dim)
-        self.fc2 = nn.Linear(dim, 1)
-
-    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(torch.cat([z_src, z_dst], dim=1))
-        h = h.relu()
-        return self.fc2(h).view(-1)
-
-
+@log_gpu
+@log_latency
 def train(
     loader: DGDataLoader,
     snapshots_loader: DGDataLoader,
@@ -137,6 +135,8 @@ def train(
     return total_loss, z
 
 
+@log_gpu
+@log_latency
 @torch.no_grad()
 def eval(
     loader: DGDataLoader,
@@ -180,9 +180,7 @@ def eval(
     return float(np.mean(perf_list))
 
 
-args = parser.parse_args()
 seed_everything(args.seed)
-
 if args.wandb:
     wandb.init(
         # set the wandb project where this run will be logged
@@ -248,7 +246,9 @@ encoder = GCNEncoder(
     num_layers=args.n_layers,
     dropout=float(args.dropout),
 ).to(args.device)
-decoder = LinkPredictor(args.embed_dim).to(args.device)
+decoder = LinkPredictor(node_dim=args.embed_dim, hidden_dim=args.embed_dim).to(
+    args.device
+)
 opt = torch.optim.Adam(
     set(encoder.parameters()) | set(decoder.parameters()), lr=float(args.lr)
 )
@@ -266,7 +266,7 @@ for epoch in range(1, args.epochs + 1):
             conversion_rate,
         )
         end_time = time.perf_counter()
-        latency = end_time - start_time
+        train_latency = end_time - start_time
 
     with hm.activate(val_key):
         start_time = time.perf_counter()
@@ -283,13 +283,13 @@ for epoch in range(1, args.epochs + 1):
         end_time = time.perf_counter()
         val_latency = end_time - start_time
     print(
-        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
+        f'Epoch={epoch:02d} Latency={train_latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
     )
 
     if (args.wandb):
         wandb.log({"train_loss":loss,
                     "val_" + METRIC_TGB_LINKPROPPRED: val_mrr,
-                    "train latency": latency,
+                    "train latency": train_latency,
                     "val latency": val_latency,
                     })
 
@@ -305,4 +305,4 @@ with hm.activate(test_key):
         evaluator,
         conversion_rate,
     )
-    print(f'Test {METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')
+log_metric(f'Test {METRIC_TGB_LINKPROPPRED}', test_mrr, epoch=args.epochs)
