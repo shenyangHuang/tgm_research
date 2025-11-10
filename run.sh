@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=long #unkillable #main #long
-#SBATCH --output=trade_gcn_1.txt 
-#SBATCH --error=trade_gcn_1_error.txt 
+#SBATCH --output=trade_rewiregcn_1.txt 
+#SBATCH --error=trade_rewiregcn_1_error.txt 
 #SBATCH --cpus-per-task=4                     # Ask for 4 CPUs
 #SBATCH --gres=gpu:1                   # Ask for 1 titan xp gpu:rtx8000:1 
 #SBATCH --mem=32G #64G                             # Ask for 32 GB of RAM
@@ -15,7 +15,7 @@ pwd
 
 # python -u examples/linkproppred/gcn.py --seed=2 --epochs=500 --device=cuda:0 --wandb
 
-# python -u examples/nodeproppred/rewire_gcn.py --seed=1 --epochs=500 --device=cuda:0 --wandb
+python -u examples/nodeproppred/rewire_gcn.py --seed=1 --epochs=500 --device=cuda:0 --wandb
 
-python -u examples/nodeproppred/gcn.py --seed=1 --epochs=500 --device=cuda:0 --wandb
+# python -u examples/nodeproppred/gcn.py --seed=1 --epochs=500 --device=cuda:0 --wandb
 
