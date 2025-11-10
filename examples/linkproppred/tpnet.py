@@ -1,6 +1,8 @@
 import argparse
 import copy
-import time
+import logging
+import os
+from pathlib import Path
 from typing import Callable, Tuple
 
 import numpy as np
@@ -10,12 +12,12 @@ import torch.nn.functional as F
 from tgb.linkproppred.evaluate import Evaluator
 from tqdm import tqdm
 
-from tgm import RecipeRegistry
+from tgm import DGBatch, DGraph
 from tgm.constants import METRIC_TGB_LINKPROPPRED, RECIPE_TGB_LINK_PRED
-from tgm.graph import DGBatch, DGData, DGraph
-from tgm.hooks import RecencyNeighborHook
-from tgm.loader import DGDataLoader
-from tgm.nn import RandomProjectionModule, Time2Vec, TPNet
+from tgm.data import DGData, DGDataLoader
+from tgm.hooks import RecencyNeighborHook, RecipeRegistry
+from tgm.nn import LinkPredictor, RandomProjectionModule, Time2Vec, TPNet
+from tgm.util.logging import enable_logging, log_gpu, log_latency, log_metric
 from tgm.util.seed import seed_everything
 
 parser = argparse.ArgumentParser(
@@ -56,6 +58,18 @@ parser.add_argument(
     default=10,
     help='the dim factor of random feature w.r.t. the node num',
 )
+parser.add_argument(
+    '--use-matrix',
+    default=True,
+    action=argparse.BooleanOptionalAction,
+    help='if no-use-matrix, will not explicitly maintain the temporal walk matrices',
+)
+parser.add_argument(
+    '--concat-src-dst',
+    default=True,
+    action=argparse.BooleanOptionalAction,
+    help='if no-concat-src-dst, Random projection avoids concat src and dst in computation',
+)
 parser.add_argument('--node-dim', type=int, default=128, help='embedding dimension')
 parser.add_argument('--time-dim', type=int, default=100, help='time encoding dimension')
 parser.add_argument(
@@ -65,18 +79,13 @@ parser.add_argument('--num-layers', type=int, default=2, help='number of model l
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
 parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
 parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+parser.add_argument(
+    '--log-file-path', type=str, default=None, help='Optional path to write logs'
+)
 
-
-class LinkPredictor(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(2 * dim, dim)
-        self.fc2 = nn.Linear(dim, 1)
-
-    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(torch.cat([z_src, z_dst], dim=1))
-        h = h.relu()
-        return self.fc2(h).sigmoid().view(-1)
+args = parser.parse_args()
+enable_logging(log_file_path=args.log_file_path)
+logger = logging.getLogger(f'tgm.{Path(__file__).stem}')
 
 
 class TPNet_LinkPrediction(nn.Module):
@@ -107,9 +116,10 @@ class TPNet_LinkPrediction(nn.Module):
             time_encoder=time_encoder,
         )
         self.rp_module = random_projection_module.to(device)
-        self.decoder = LinkPredictor(output_dim).to(
-            device
-        )  # @TODO: Make encoder/decoder to be explicit
+        # @TODO: Make encoder/decoder to be explicit
+        self.decoder = LinkPredictor(
+            node_dim=args.embed_dim, hidden_dim=args.embed_dim
+        ).to(args.device)
 
     def forward(
         self, batch: DGBatch, static_node_feat: torch.Tensor
@@ -183,6 +193,8 @@ class TPNet_LinkPrediction(nn.Module):
         return pos_out, neg_out
 
 
+@log_gpu
+@log_latency
 def train(
     loader: DGDataLoader,
     model: nn.Module,
@@ -195,14 +207,16 @@ def train(
         opt.zero_grad()
         pos_out, neg_out = model(batch, static_node_feat)
 
-        loss = F.binary_cross_entropy(pos_out, torch.ones_like(pos_out))
-        loss += F.binary_cross_entropy(neg_out, torch.zeros_like(neg_out))
+        loss = F.binary_cross_entropy_with_logits(pos_out, torch.ones_like(pos_out))
+        loss += F.binary_cross_entropy_with_logits(neg_out, torch.zeros_like(neg_out))
         loss.backward()
         opt.step()
         total_loss += float(loss)
     return total_loss
 
 
+@log_gpu
+@log_latency
 @torch.no_grad()
 def eval(
     evaluator: Evaluator,
@@ -212,7 +226,9 @@ def eval(
 ) -> float:
     model.eval()
     perf_list = []
-    for batch in tqdm(loader):
+    max_eval_batches_per_epoch = os.getenv('TGM_CI_MAX_EVAL_BATCHES_PER_EPOCH')
+
+    for batch_num, batch in enumerate(tqdm(loader)):
         copy_batch = copy.deepcopy(batch)
         for idx, neg_batch in enumerate(batch.neg_batch_list):
             copy_batch.src = batch.src[idx].unsqueeze(0)
@@ -237,6 +253,7 @@ def eval(
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
             pos_out, neg_out = model(copy_batch, static_node_feat)
+            pos_out, neg_out = pos_out.sigmoid(), neg_out.sigmoid()
 
             input_dict = {
                 'y_pred_pos': pos_out,
@@ -245,41 +262,42 @@ def eval(
             }
             perf_list.append(evaluator.eval(input_dict)[METRIC_TGB_LINKPROPPRED])
 
+        if max_eval_batches_per_epoch and batch_num >= int(max_eval_batches_per_epoch):
+            logger.warning(
+                f'Exiting evaluation prematurely since max_eval_batches_per_epoch ({max_eval_batches_per_epoch}) was reached. Reported performance may not reflect ground truth on the entire dataset.'
+            )
+            break
+
     return float(np.mean(perf_list))
 
 
-args = parser.parse_args()
 seed_everything(args.seed)
-
 evaluator = Evaluator(name=args.dataset)
 
-data = DGData.from_tgb(args.dataset)
-dgraph = DGraph(data)
-
-num_nodes = dgraph.num_nodes
-edge_feats_dim = dgraph.edge_feats_dim
-
-if dgraph.static_node_feats is not None:
-    static_node_feat = dgraph.static_node_feats
-else:
-    static_node_feat = torch.randn((num_nodes, args.node_dim), device=args.device)
-
-train_data, val_data, test_data = data.split()
-
+train_data, val_data, test_data = DGData.from_tgb(args.dataset).split()
 train_dg = DGraph(train_data, device=args.device)
 val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
-nbr_hook = RecencyNeighborHook(
-    num_nbrs=[args.num_neighbors],
-    num_nodes=num_nodes,
-    edge_feats_dim=edge_feats_dim,
-)
+if train_dg.static_node_feats is not None:
+    static_node_feat = train_dg.static_node_feats
+else:
+    static_node_feat = torch.randn(
+        (test_dg.num_nodes, args.node_dim), device=args.device
+    )
+
 
 hm = RecipeRegistry.build(
     RECIPE_TGB_LINK_PRED, dataset_name=args.dataset, train_dg=train_dg
 )
-hm.register_shared(nbr_hook)
+hm.register_shared(
+    RecencyNeighborHook(
+        num_nbrs=[args.num_neighbors],
+        num_nodes=test_dg.num_nodes,
+        seed_nodes_keys=['src', 'dst', 'neg'],
+        seed_times_keys=['time', 'time', 'neg_time'],
+    )
+)
 train_key, val_key, test_key = hm.keys
 
 train_loader = DGDataLoader(train_dg, args.bsize, hook_manager=hm)
@@ -287,19 +305,21 @@ val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)
 test_loader = DGDataLoader(test_dg, args.bsize, hook_manager=hm)
 
 random_projection_module = RandomProjectionModule(
-    num_nodes=num_nodes,
+    num_nodes=test_dg.num_nodes,
     num_layer=args.rp_num_layers,
     time_decay_weight=args.rp_time_decay_weight,
-    beginning_time=dgraph.start_time,
+    beginning_time=train_dg.start_time,
+    use_matrix=bool(args.use_matrix),
     enforce_dim=args.enforce_dim,
     num_edges=train_dg.num_edges,
     dim_factor=args.rp_dim_factor,
+    concat_src_dst=bool(args.concat_src_dst),
     device=args.device,
 )
 
 model = TPNet_LinkPrediction(
     node_feat_dim=static_node_feat.shape[1],
-    edge_feat_dim=edge_feats_dim,
+    edge_feat_dim=train_dg.edge_feats_dim,
     time_feat_dim=args.time_dim,
     output_dim=args.embed_dim,
     dropout=args.dropout,
@@ -314,15 +334,13 @@ opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
 
 for epoch in range(1, args.epochs + 1):
     with hm.activate(train_key):
-        start_time = time.perf_counter()
         loss = train(train_loader, model, opt, static_node_feat)
-        end_time = time.perf_counter()
-        latency = end_time - start_time
     with hm.activate(val_key):
         val_mrr = eval(evaluator, val_loader, model, static_node_feat)
-        print(
-            f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
-        )
+
+    log_metric('Loss', loss, epoch=epoch)
+    log_metric(f'Validation {METRIC_TGB_LINKPROPPRED}', val_mrr, epoch=epoch)
+
     # Clear memory state between epochs, except last epoch
     if epoch < args.epochs:
         hm.reset_state()
@@ -330,4 +348,4 @@ for epoch in range(1, args.epochs + 1):
 
 with hm.activate(test_key):
     test_mrr = eval(evaluator, test_loader, model, static_node_feat)
-    print(f'Test MRR:{METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')
+log_metric(f'Test {METRIC_TGB_LINKPROPPRED}', test_mrr, epoch=args.epochs)

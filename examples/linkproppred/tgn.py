@@ -1,13 +1,11 @@
 import argparse
 import copy
-import time
 from typing import Callable, Dict, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 from torch import Tensor
 from torch.nn import GRUCell
@@ -16,15 +14,16 @@ from torch_geometric.nn.inits import zeros
 from torch_geometric.utils import scatter
 from tqdm import tqdm
 
-from tgm import DGData, DGraph, RecipeRegistry
+from tgm import DGraph
 from tgm.constants import (
     METRIC_TGB_LINKPROPPRED,
     PADDED_NODE_ID,
     RECIPE_TGB_LINK_PRED,
 )
-from tgm.hooks import RecencyNeighborHook
-from tgm.loader import DGDataLoader
-from tgm.nn import Time2Vec
+from tgm.data import DGData, DGDataLoader
+from tgm.hooks import RecencyNeighborHook, RecipeRegistry
+from tgm.nn import LinkPredictor, Time2Vec
+from tgm.util.logging import enable_logging, log_gpu, log_latency, log_metric
 from tgm.util.seed import seed_everything
 
 parser = argparse.ArgumentParser(
@@ -47,18 +46,12 @@ parser.add_argument(
     default=[10],
     help='num sampled nbrs at each hop',
 )
+parser.add_argument(
+    '--log-file-path', type=str, default=None, help='Optional path to write logs'
+)
 
-
-class LinkPredictor(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(2 * dim, dim)
-        self.fc2 = nn.Linear(dim, 1)
-
-    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(torch.cat([z_src, z_dst], dim=1))
-        h = h.relu()
-        return self.fc2(h).sigmoid().view(-1)
+args = parser.parse_args()
+enable_logging(log_file_path=args.log_file_path)
 
 
 class GraphAttentionEmbedding(torch.nn.Module):
@@ -213,7 +206,7 @@ class TGNMemory(torch.nn.Module):
 
         # Get local copy of updated `last_update`.
         dim_size = self.last_update.size(0)
-        last_update = scatter(t, idx, 0, dim_size, reduce='max')[n_id]
+        last_update = scatter(t, idx.long(), 0, dim_size, reduce='max')[n_id]
         return memory, last_update
 
     def _update_msg_store(
@@ -251,6 +244,8 @@ class TGNMemory(torch.nn.Module):
         super().train(mode)
 
 
+@log_gpu
+@log_latency
 def train(
     loader: DGDataLoader,
     memory: nn.Module,
@@ -318,13 +313,14 @@ def train(
     return total_loss
 
 
+@log_gpu
+@log_latency
 @torch.no_grad()
 def eval(
     loader: DGDataLoader,
     memory: nn.Module,
     encoder: nn.Module,
     decoder: nn.Module,
-    eval_metric: str,
     evaluator: Evaluator,
 ) -> float:
     memory.eval()
@@ -367,14 +363,14 @@ def eval(
 
             inv_src = batch.global_to_local(src_ids)
             inv_dst = batch.global_to_local(dst_ids)
-            y_pred = decoder(z[inv_src], z[inv_dst])
+            y_pred = decoder(z[inv_src], z[inv_dst]).sigmoid()
 
             input_dict = {
                 'y_pred_pos': y_pred[0],
                 'y_pred_neg': y_pred[1:],
-                'eval_metric': [eval_metric],
+                'eval_metric': [METRIC_TGB_LINKPROPPRED],
             }
-            perf_list.append(evaluator.eval(input_dict)[eval_metric])
+            perf_list.append(evaluator.eval(input_dict)[METRIC_TGB_LINKPROPPRED])
 
         # Update memory with ground-truth state.
         memory.update_state(batch.src, batch.dst, batch.time, batch.edge_feats.float())
@@ -382,15 +378,8 @@ def eval(
     return float(np.mean(perf_list))
 
 
-args = parser.parse_args()
 seed_everything(args.seed)
-
-dataset = PyGLinkPropPredDataset(name=args.dataset, root='datasets')
-eval_metric = dataset.eval_metric
-neg_sampler = dataset.negative_sampler
 evaluator = Evaluator(name=args.dataset)
-dataset.load_val_ns()
-dataset.load_test_ns()
 
 train_data, val_data, test_data = DGData.from_tgb(args.dataset).split()
 train_dg = DGraph(train_data, device=args.device)
@@ -400,7 +389,8 @@ test_dg = DGraph(test_data, device=args.device)
 nbr_hook = RecencyNeighborHook(
     num_nbrs=args.n_nbrs,
     num_nodes=test_dg.num_nodes,  # Assuming node ids at test set > train/val set
-    edge_feats_dim=test_dg.edge_feats_dim,
+    seed_nodes_keys=['src', 'dst', 'neg'],
+    seed_times_keys=['time', 'time', 'neg_time'],
 )
 
 hm = RecipeRegistry.build(
@@ -429,7 +419,9 @@ encoder = GraphAttentionEmbedding(
     msg_dim=test_dg.edge_feats_dim,
     time_enc=memory.time_enc,
 ).to(args.device)
-decoder = LinkPredictor(args.embed_dim).to(args.device)
+decoder = LinkPredictor(node_dim=args.embed_dim, hidden_dim=args.embed_dim).to(
+    args.device
+)
 opt = torch.optim.Adam(
     set(memory.parameters()) | set(encoder.parameters()) | set(decoder.parameters()),
     lr=args.lr,
@@ -437,21 +429,17 @@ opt = torch.optim.Adam(
 
 for epoch in range(1, args.epochs + 1):
     with hm.activate(train_key):
-        start_time = time.perf_counter()
         loss = train(train_loader, memory, encoder, decoder, opt)
-        end_time = time.perf_counter()
-        latency = end_time - start_time
 
     with hm.activate(val_key):
-        val_mrr = eval(val_loader, memory, encoder, decoder, eval_metric, evaluator)
-    print(
-        f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
-    )
+        val_mrr = eval(val_loader, memory, encoder, decoder, evaluator)
+    log_metric('Loss', loss, epoch=epoch)
+    log_metric(f'Validation {METRIC_TGB_LINKPROPPRED}', val_mrr, epoch=epoch)
 
     if epoch < args.epochs:  # Reset hooks after each epoch, except last epoch
         hm.reset_state()
 
 
 with hm.activate(test_key):
-    test_mrr = eval(test_loader, memory, encoder, decoder, eval_metric, evaluator)
-    print(f'Test {METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')
+    test_mrr = eval(test_loader, memory, encoder, decoder, evaluator)
+log_metric(f'Test {METRIC_TGB_LINKPROPPRED}', test_mrr, epoch=args.epochs)

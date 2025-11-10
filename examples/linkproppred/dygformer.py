@@ -1,6 +1,5 @@
 import argparse
 import copy
-import time
 from typing import Callable, Tuple
 
 import numpy as np
@@ -10,12 +9,12 @@ import torch.nn.functional as F
 from tgb.linkproppred.evaluate import Evaluator
 from tqdm import tqdm
 
-from tgm import RecipeRegistry
+from tgm import DGBatch, DGraph
 from tgm.constants import METRIC_TGB_LINKPROPPRED, RECIPE_TGB_LINK_PRED
-from tgm.graph import DGBatch, DGData, DGraph
-from tgm.hooks import RecencyNeighborHook
-from tgm.loader import DGDataLoader
-from tgm.nn import DyGFormer, Time2Vec
+from tgm.data import DGData, DGDataLoader
+from tgm.hooks import RecencyNeighborHook, RecipeRegistry
+from tgm.nn import DyGFormer, LinkPredictor, Time2Vec
+from tgm.util.logging import enable_logging, log_gpu, log_latency, log_metric
 from tgm.util.seed import seed_everything
 
 parser = argparse.ArgumentParser(
@@ -55,18 +54,12 @@ parser.add_argument(
     help='number of channels used in attention layer',
 )
 parser.add_argument('--bsize', type=int, default=200, help='batch size')
+parser.add_argument(
+    '--log-file-path', type=str, default=None, help='Optional path to write logs'
+)
 
-
-class LinkPredictor(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(2 * dim, dim)
-        self.fc2 = nn.Linear(dim, 1)
-
-    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(torch.cat([z_src, z_dst], dim=1))
-        h = h.relu()
-        return self.fc2(h).sigmoid().view(-1)
+args = parser.parse_args()
+enable_logging(log_file_path=args.log_file_path)
 
 
 class DyGFormer_LinkPrediction(nn.Module):
@@ -102,11 +95,14 @@ class DyGFormer_LinkPrediction(nn.Module):
             time_encoder,
             device,
         )
+        # @TODO: Make encoder/decoder to be explicit
         self.decoder = LinkPredictor(
-            output_dim
-        )  # @TODO: Make encoder/decoder to be explicit
+            node_dim=args.embed_dim, hidden_dim=args.embed_dim
+        ).to(args.device)
 
-    def forward(self, batch: DGBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, batch: DGBatch, static_node_feat: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         src = batch.src
         dst = batch.dst
         neg = batch.neg
@@ -120,7 +116,7 @@ class DyGFormer_LinkPrediction(nn.Module):
         # positive edge
         edge_idx_pos = torch.stack((src, dst), dim=0)
         z_src_pos, z_dst_pos = self.encoder(
-            STATIC_NODE_FEAT,
+            static_node_feat,
             edge_idx_pos,
             time,
             nbr_nids[: pos_batch_size * 2],
@@ -163,7 +159,7 @@ class DyGFormer_LinkPrediction(nn.Module):
 
         # negative edge
         z_src_neg, z_dst_neg = self.encoder(
-            STATIC_NODE_FEAT,
+            static_node_feat,
             edge_idx_neg,
             time,
             torch.cat([src_nbr_nids, neg_nbr_nids], dim=0),
@@ -175,30 +171,36 @@ class DyGFormer_LinkPrediction(nn.Module):
         return pos_out, neg_out
 
 
+@log_gpu
+@log_latency
 def train(
     loader: DGDataLoader,
     model: nn.Module,
     opt: torch.optim.Optimizer,
+    static_node_feat: torch.Tensor,
 ) -> float:
     model.train()
     total_loss = 0
     for batch in tqdm(loader):
         opt.zero_grad()
-        pos_out, neg_out = model(batch)
+        pos_out, neg_out = model(batch, static_node_feat)
 
-        loss = F.binary_cross_entropy(pos_out, torch.ones_like(pos_out))
-        loss += F.binary_cross_entropy(neg_out, torch.zeros_like(neg_out))
+        loss = F.binary_cross_entropy_with_logits(pos_out, torch.ones_like(pos_out))
+        loss += F.binary_cross_entropy_with_logits(neg_out, torch.zeros_like(neg_out))
         loss.backward()
         opt.step()
         total_loss += float(loss)
     return total_loss
 
 
+@log_gpu
+@log_latency
 @torch.no_grad()
 def eval(
     evaluator: Evaluator,
     loader: DGDataLoader,
     model: nn.Module,
+    static_node_feat: torch.Tensor,
 ) -> float:
     model.eval()
     perf_list = []
@@ -226,7 +228,8 @@ def eval(
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
-            pos_out, neg_out = model(copy_batch)
+            pos_out, neg_out = model(copy_batch, static_node_feat)
+            pos_out, neg_out = pos_out.sigmoid(), neg_out.sigmoid()
 
             input_dict = {
                 'y_pred_pos': pos_out,
@@ -238,9 +241,7 @@ def eval(
     return float(np.mean(perf_list))
 
 
-args = parser.parse_args()
 seed_everything(args.seed)
-
 evaluator = Evaluator(name=args.dataset)
 
 full_data = DGData.from_tgb(args.dataset)
@@ -254,16 +255,17 @@ val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
 if train_dg.static_node_feats is not None:
-    STATIC_NODE_FEAT = train_dg.static_node_feats
+    static_node_feat = train_dg.static_node_feats
 else:
-    STATIC_NODE_FEAT = torch.randn(
+    static_node_feat = torch.randn(
         (test_dg.num_nodes, args.node_dim), device=args.device
     )
 
 nbr_hook = RecencyNeighborHook(
     num_nbrs=[args.max_sequence_length - 1],  # 1 remaining for seed node itself
     num_nodes=num_nodes,
-    edge_feats_dim=edge_feats_dim,
+    seed_nodes_keys=['src', 'dst', 'neg'],
+    seed_times_keys=['time', 'time', 'neg_time'],
 )
 
 hm = RecipeRegistry.build(
@@ -277,7 +279,7 @@ val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)
 test_loader = DGDataLoader(test_dg, args.bsize, hook_manager=hm)
 
 model = DyGFormer_LinkPrediction(
-    node_feat_dim=STATIC_NODE_FEAT.shape[1],
+    node_feat_dim=static_node_feat.shape[1],
     edge_feat_dim=edge_feats_dim,
     time_feat_dim=args.time_dim,
     channel_embedding_dim=args.channel_embedding_dim,
@@ -295,19 +297,17 @@ opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
 
 for epoch in range(1, args.epochs + 1):
     with hm.activate(train_key):
-        start_time = time.perf_counter()
-        loss = train(train_loader, model, opt)
-        end_time = time.perf_counter()
-        latency = end_time - start_time
+        loss = train(train_loader, model, opt, static_node_feat)
     with hm.activate(val_key):
-        val_mrr = eval(evaluator, val_loader, model)
-        print(
-            f'Epoch={epoch:02d} Latency={latency:.4f} Loss={loss:.4f} Validation {METRIC_TGB_LINKPROPPRED}={val_mrr:.4f}'
-        )
+        val_mrr = eval(evaluator, val_loader, model, static_node_feat)
+
+    log_metric('Loss', loss, epoch=epoch)
+    log_metric(f'Validation {METRIC_TGB_LINKPROPPRED}', val_mrr, epoch=epoch)
+
     # Clear memory state between epochs, except last epoch
     if epoch < args.epochs:
         hm.reset_state()
 
 with hm.activate(test_key):
-    test_mrr = eval(evaluator, test_loader, model)
-    print(f'Test MRR:{METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')
+    test_mrr = eval(evaluator, test_loader, model, static_node_feat)
+log_metric(f'Test {METRIC_TGB_LINKPROPPRED}', test_mrr, epoch=args.epochs)

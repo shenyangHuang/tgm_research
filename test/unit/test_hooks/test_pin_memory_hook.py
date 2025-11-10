@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -8,7 +10,7 @@ from tgm.hooks import PinMemoryHook
 
 @pytest.fixture
 def dg():
-    edge_index = torch.LongTensor([[1, 10], [1, 11], [1, 12], [1, 13]])
+    edge_index = torch.IntTensor([[1, 10], [1, 11], [1, 12], [1, 13]])
     edge_timestamps = torch.LongTensor([1, 1, 2, 2])
     data = DGData.from_raw(edge_timestamps, edge_index)
     return DGraph(data)
@@ -21,6 +23,14 @@ def test_hook_dependancies():
 
 def test_hook_reset_state():
     assert PinMemoryHook.has_state == False
+
+
+def test_pin_memory_hook_no_gpu_available(dg):
+    with patch('torch.cuda.is_available', return_value=False):
+        hook = PinMemoryHook()
+        batch = dg.materialize()
+        processed_batch = hook(dg, batch)
+        assert torch.equal(batch.src, processed_batch.src)
 
 
 @pytest.mark.gpu
