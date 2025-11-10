@@ -123,6 +123,8 @@ class GraphMixerHook(StatelessHook):
         self._time_gap = time_gap
 
     def __call__(self, dg: DGraph, batch: DGBatch) -> DGBatch:
+        batch.start_idx = dg._slice.start_idx
+        batch.end_idx = dg._slice.end_idx
         # Construct a the time_gap slice
         time_gap_slice = replace(dg._slice)
         time_gap_slice.start_idx = max(dg._slice.end_idx - self._time_gap, 0)
@@ -179,7 +181,8 @@ class GraphMixerEncoder(nn.Module):
     def forward(self, batch: DGBatch, node_feat: torch.Tensor) -> torch.Tensor:
         # Link Encoder
         edge_feat = batch.nbr_feats[0]
-        nbr_time_feat = self.time_encoder(batch.times[0][:, None] - batch.nbr_times[0])
+        time_input = batch.times[0][:, None] - batch.nbr_times[0]
+        nbr_time_feat = self.time_encoder(time_input)
         z_link = self.projection_layer(torch.cat([edge_feat, nbr_time_feat], dim=-1))
         for mixer in self.mlp_mixers:
             z_link = mixer(z_link)
@@ -276,9 +279,13 @@ def eval_full(
     encoder: nn.Module,
     decoder: nn.Module,
     static_node_feat: torch.tensor,
+    test_dg: DGraph,
     test_edge_set: np.ndarray = None,
 ) -> float:
     test_edge_dict = test_edge_set2dict(test_edge_set)
+
+
+    gmh = GraphMixerHook(time_gap=args.time_gap)
 
     encoder.eval()
     decoder.eval()
@@ -309,20 +316,18 @@ def eval_full(
                 ],
                 dim=0,
             ).long()
+
+            
             copy_batch.nbr_nids = [batch.nbr_nids[0][all_idx]]
             copy_batch.nbr_times = [batch.nbr_times[0][all_idx]]
             copy_batch.nbr_feats = [batch.nbr_feats[0][all_idx]]
 
+            copy_batch.times[0] = batch.time[idx].repeat(len(all_idx))
 
-            
-            id_map = {nid.item(): i for i, nid in enumerate(copy_batch.nids[0])}
-            dst_ids = torch.cat([batch.dst[idx].unsqueeze(0), copy_batch.neg])
-            src_ids = batch.src[idx].repeat(len(dst_ids))
-
-
+            copy_batch = gmh(dg=test_dg.slice_events(batch.start_idx, batch.end_idx), batch=copy_batch)          
             z = encoder(copy_batch, static_node_feat)
-            src_idx = torch.tensor([id_map[n.item()] for n in src_ids], device=z.device)
-            dst_idx = torch.tensor([id_map[n.item()] for n in dst_ids], device=z.device)
+            dst_idx = torch.arange(start=1, end=len(all_idx), step=1, dtype=torch.long, device=z.device, requires_grad=False)
+            src_idx = torch.zeros(len(dst_idx), dtype=torch.long, device=z.device, requires_grad=False)
             z_src = z[src_idx]
             z_dst = z[dst_idx]
             y_pred = decoder(z_src, z_dst).sigmoid()
@@ -441,7 +446,7 @@ for epoch in range(1, args.epochs + 1):
     if (val_mrr > best_val_mrr):
         best_val_mrr = val_mrr
         with hm.activate('test_full'):
-            test_mrr, full_mrr_list, per_link_rows = eval_full(evaluator, test_loader, encoder, decoder, static_node_feat, test_edge_set=test_edge_set)
+            test_mrr, full_mrr_list, per_link_rows = eval_full(evaluator, test_loader, encoder, decoder, static_node_feat, test_dg, test_edge_set=test_edge_set)
             print(f'Test MRR Full {METRIC_TGB_LINKPROPPRED}={test_mrr:.4f}')   
 
     if epoch < args.epochs:  # Reset hooks after each epoch, except last epoch
