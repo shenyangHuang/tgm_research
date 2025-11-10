@@ -153,8 +153,8 @@ test_dg = DGraph(test_data)
 train_data = train_dg.materialize(materialize_features=False)
 
 hm = HookManager(keys=['val', 'test', 'test_full'])
-hm.register('val', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='val'))
-hm.register('test', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='test'))
+hm.register('val', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='val'))
+hm.register('test', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='test'))
 hm.register('test_full', FullNegativeHook(valid_dst))
 
 val_loader = DGDataLoader(val_dg, args.bsize, hook_manager=hm)

@@ -407,13 +407,14 @@ _, dst, _ = train_dg.edges
 nbr_hook = RecencyNeighborHook(
     num_nbrs=[args.num_neighbors],
     num_nodes=num_nodes,
-    edge_feats_dim=edge_feats_dim,
+    seed_nodes_keys=['src', 'dst', 'neg'],
+    seed_times_keys=['time', 'time', 'neg_time'],
 )
 
 hm = HookManager(keys=['train', 'val', 'test', 'test_full'])
 hm.register('train', NegativeEdgeSamplerHook(low=int(dst.min()), high=int(dst.max())))
-hm.register('val', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='val'))
-hm.register('test', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='test'))
+hm.register('val', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='val'))
+hm.register('test', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='test'))
 hm.register('test_full', FullNegativeHook(valid_dst))
 hm.register_shared(nbr_hook)
 

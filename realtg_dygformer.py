@@ -398,14 +398,15 @@ _, dst, _ = train_dg.edges
 nbr_hook = RecencyNeighborHook(
     num_nbrs=[args.max_sequence_length - 1],  # 1 remaining for seed node itself
     num_nodes=num_nodes,
-    edge_feats_dim=edge_feats_dim,
+    seed_nodes_keys=['src', 'dst', 'neg'],
+    seed_times_keys=['time', 'time', 'neg_time'],
 )
 
 hm = HookManager(keys=['train', 'val', 'test', 'test_full'])
 hm.register_shared(nbr_hook)
 hm.register('train', NegativeEdgeSamplerHook(low=int(dst.min()), high=int(dst.max())))
-hm.register('val', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='val'))
-hm.register('test', TGBNegativeEdgeSamplerHook(neg_sampler, split_mode='test'))
+hm.register('val', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='val'))
+hm.register('test', TGBNegativeEdgeSamplerHook(dataset_name=args.dataset, split_mode='test'))
 hm.register('test_full', FullNegativeHook(valid_dst))
 
 
@@ -453,10 +454,10 @@ for epoch in range(1, args.epochs + 1):
         if (args.seed == 1):
             try:
                 # store both metrics per link (your writer should accept 5 columns under the chosen field)
-                add_to_jsonl(per_link_rows, test_file, field_name="TPNet")
-                print(f"\tWrote  TPNet per-link MRRs to {test_file} (field='tpnet_mrr').")
+                add_to_jsonl(per_link_rows, test_file, field_name="DyGformer")
+                print(f"\tWrote  Dygformer per-link MRRs to {test_file} (field='dygformer_mrr').")
             except Exception as e:
-                print(f"\tWARNING: failed to write TPNet per-link MRRs: {e}")
+                print(f"\tWARNING: failed to write Dygformer per-link MRRs: {e}")
 
     # Clear memory state between epochs, except last epoch
     if epoch < args.epochs:
