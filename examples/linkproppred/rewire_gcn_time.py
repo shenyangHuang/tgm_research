@@ -83,7 +83,7 @@ class RewiredGCN(nn.Module):
         '''
         z = self.expander(past_embeddings, expander_edge_index)
         z = z + node_feat
-        z = self.encoder(batch, node_feat)
+        z = self.encoder(batch, z)
         return z
 
 
