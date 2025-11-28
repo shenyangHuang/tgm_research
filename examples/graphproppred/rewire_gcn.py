@@ -1,4 +1,6 @@
-r"""python -u gcn_rewired.py --epochs=100 --device=cuda:0
+r"""
+#! to do
+python -u gcn_rewired.py --epochs=100 --device=cuda:0
 """
 import argparse
 import time
@@ -14,9 +16,9 @@ from tgb.nodeproppred.evaluate import Evaluator
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
-from tgm import DGBatch, DGraph
-from tgm.data import DGData, DGDataLoader
+from tgm import DGBatch, DGData, DGraph
 from tgm.constants import METRIC_TGB_NODEPROPPRED
+from tgm.loader import DGDataLoader
 from tgm.util.seed import seed_everything
 from cayley_construction import batched_augment_cayley, build_cayley_bank
 

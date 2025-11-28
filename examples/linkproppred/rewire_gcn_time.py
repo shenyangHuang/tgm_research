@@ -14,16 +14,16 @@ from tgb.linkproppred.evaluate import Evaluator
 from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 
-from tgm import DGBatch, DGData, DGraph, RecipeRegistry
+from tgm import DGBatch, DGraph, TimeDeltaDG
+from tgm.data import DGData, DGDataLoader
+from tgm.hooks import RecipeRegistry
 from tgm.constants import METRIC_TGB_LINKPROPPRED, RECIPE_TGB_LINK_PRED
-from tgm.loader import DGDataLoader
-from tgm.timedelta import TimeDeltaDG
 from tgm.util.seed import seed_everything
 from cayley_construction import batched_augment_cayley, build_cayley_bank
 
 
 parser = argparse.ArgumentParser(
-    description='GCN LinkPropPred Example',
+    description='GCN LinkPropPred Example through time',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument('--seed', type=int, default=1337, help='random seed to use')
@@ -34,9 +34,9 @@ parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--dropout', type=str, default=0.1, help='dropout rate')
 parser.add_argument('--n-layers', type=int, default=2, help='number of GCN layers')
 parser.add_argument('--embed-dim', type=int, default=128, help='embedding dimension')
-parser.add_argument(
-    '--node-dim', type=int, default=256, help='node feat dimension if not provided'
-)
+# parser.add_argument(
+#     '--node-dim', type=int, default=256, help='node feat dimension if not provided'
+# )
 parser.add_argument('--bsize', type=int, default=200, help='batch size')
 parser.add_argument(
     '--snapshot-time-gran',
@@ -75,10 +75,15 @@ class RewiredGCN(nn.Module):
         )
 
     def forward(
-        self, batch: DGBatch, node_feat: torch.Tensor, expander_edge_index: torch.Tensor
+        self, batch: DGBatch, node_feat: torch.Tensor, expander_edge_index: torch.Tensor, past_embeddings: torch.Tensor,
     ):
+        '''
+        1. try to rewire with past embeddings
+        2. use the combined embedding with current node feat to run with GCN
+        '''
+        z = self.expander(past_embeddings, expander_edge_index)
+        z = z + node_feat
         z = self.encoder(batch, node_feat)
-        z = self.expander(z, expander_edge_index)
         return z
 
 
@@ -191,8 +196,10 @@ def train(
 
     snapshots_iterator = iter(snapshots_loader)
     snapshot_batch = next(snapshots_iterator)
-    z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
+    prev_embed = static_node_feats.detach().clone()
+    z = encoder(snapshot_batch, static_node_feats, expander_edge_index, prev_embed)
     z = z.detach()
+    prev_embed = z
 
     for batch in tqdm(loader):
         opt.zero_grad()
@@ -210,11 +217,12 @@ def train(
         while batch.time[-1] > (snapshot_batch.time[-1] + 1) * conversion_rate:
             try:
                 snapshot_batch = next(snapshots_iterator)
-                z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
+                z = encoder(snapshot_batch, static_node_feats, expander_edge_index, prev_embed)
                 z = z.detach()
+                prev_embed = z
             except StopIteration:
                 pass
-
+    z = z.detach()
     return total_loss, z
 
 
@@ -237,6 +245,7 @@ def eval(
 
     snapshots_iterator = iter(snapshots_loader)
     snapshot_batch = next(snapshots_iterator)
+    prev_embed = z
 
     for batch in tqdm(loader):
         neg_batch_list = batch.neg_batch_list
@@ -256,7 +265,9 @@ def eval(
         while batch.time[-1] > (snapshot_batch.time[-1] + 1) * conversion_rate:
             try:
                 snapshot_batch = next(snapshots_iterator)
-                z = encoder(snapshot_batch, static_node_feats, expander_edge_index)
+                z = encoder(snapshot_batch, static_node_feats, expander_edge_index, prev_embed)
+                z = z.detach()
+                prev_embed = z
             except StopIteration:
                 pass
 
@@ -321,8 +332,11 @@ if train_dg.static_node_feats is not None:
     static_node_feats = train_dg.static_node_feats
 else:
     static_node_feats = torch.randn(
-        (test_dg.num_nodes, args.node_dim), device=args.device
-    )
+        (test_dg.num_nodes, args.embed_dim), device=args.device
+    ) #! for the forward pass, we must ensure the node dim is same as embed dim
+    # static_node_feats = torch.randn(
+    #     (test_dg.num_nodes, args.node_dim), device=args.device
+    # )
 
 
 #! load cached cayley graph if possible
