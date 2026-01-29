@@ -7,12 +7,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
 from tgb.nodeproppred.evaluate import Evaluator
 from tqdm import tqdm
 
 from tgm.constants import METRIC_TGB_NODEPROPPRED
-from tgm.graph import DGBatch, DGData, DGraph
-from tgm.loader import DGDataLoader
+from tgm import DGBatch, DGraph
+from tgm.data import DGData, DGDataLoader
 from tgm.nn.recurrent import TGCN
 from tgm.util.seed import seed_everything
 from cayley_construction import batched_augment_cayley, build_cayley_bank
@@ -38,6 +39,77 @@ parser.add_argument(
     default='Y',
     help='time granularity to operate on for snapshots',
 )
+class GCNProp(nn.Module):    
+    def __init__(
+        self,
+        in_channels: int,
+        embed_dim: int,
+        out_channels: int,
+        num_layers: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.dropout = dropout
+        self.convs = torch.nn.ModuleList()
+        self.bns = torch.nn.ModuleList()
+
+        self.convs.append(GCNConv(in_channels, embed_dim))
+        self.bns.append(torch.nn.BatchNorm1d(embed_dim))
+
+        for _ in range(num_layers - 2):
+            self.convs.append(GCNConv(embed_dim, embed_dim))
+            self.bns.append(torch.nn.BatchNorm1d(embed_dim))
+        self.convs.append(GCNConv(embed_dim, out_channels))
+
+    def reset_parameters(self) -> None:
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+
+    def forward(self, x, edge_index):
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index)
+            x = self.bns[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](x, edge_index)
+        return x
+
+
+class RewiredTGCN(torch.nn.Module):
+    def __init__(self, node_dim: int, embed_dim: int, num_exp_layers: int = 1, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.recurrent = TGCN(in_channels=node_dim, out_channels=embed_dim)
+        self.linear = nn.Linear(embed_dim, embed_dim)
+        self.expander = GCNProp(
+            in_channels=embed_dim,
+            embed_dim=embed_dim,
+            out_channels=embed_dim,
+            num_layers=num_exp_layers,
+            dropout=dropout,
+        )
+
+
+    def forward(
+        self,
+        batch: DGBatch,
+        node_feat: torch.tensor,
+        expander_edge_index: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        edge_index = torch.stack([batch.src, batch.dst], dim=0)
+        edge_weight = batch.edge_weight if hasattr(batch, 'edge_weight') else None  # type: ignore
+
+        h_0 = self.recurrent(node_feat, edge_index, edge_weight, h)
+        h_0 = self.expander(h_0, expander_edge_index)
+        z = F.relu(h_0)
+        z = self.linear(z)
+        return z, h_0
+
+
+
 
 
 class RecurrentGCN(torch.nn.Module):
