@@ -2,6 +2,8 @@
 import torch
 from torch_geometric.data import HeteroData
 from tgm.data import DGData
+from tgm import DGraph
+from tgm.exceptions import EmptyGraphError
 
 def from_relbench_heterodata(data: HeteroData) -> DGData:
     """
@@ -61,7 +63,7 @@ def from_relbench_heterodata(data: HeteroData) -> DGData:
         else:
             # Static edge, timestamp 0?
             # Or assume global time 0.
-            times = torch.zeros(src_global.size(0), dtype=torch.long) # RelBench usually uses long/int timestamps
+            times = torch.zeros(src_global.size(0), dtype=torch.int)
             
         edge_srcs.append(src_global)
         edge_dsts.append(dst_global)
@@ -70,9 +72,8 @@ def from_relbench_heterodata(data: HeteroData) -> DGData:
 
     # 3. Concatenate and Sort
     if not edge_srcs:
-        # Empty graph?
-        return DGData(edge_index=torch.empty((2, 0)), edge_time=torch.empty(0))
-        
+        raise EmptyGraphError('Can\'t construct TGM graph with empty RDL graph')
+
     all_src = torch.cat(edge_srcs)
     all_dst = torch.cat(edge_dsts)
     all_time = torch.cat(edge_times)
@@ -92,12 +93,15 @@ def from_relbench_heterodata(data: HeteroData) -> DGData:
     # DGData usually takes float time, but RelBench has int timestamps (days/seconds).
     # DGData.from_raw allows specifying edge_time.
     
-    return DGData.from_raw(
-        edge_index=edge_index,
-        edge_time=all_time.float(), # Convert to float for general compatibility
-        edge_type=all_type
+    dg_data = DGData.from_raw(
+        edge_time=all_time.to(torch.int32),  #! Relbench stores time as float, for tgm we are converting to float here
+        edge_index=edge_index.t().to(torch.int32), #! tgm is taking [num_edges, 2]
+        edge_type=all_type.to(torch.int32), #! tgm is taking int32
         # Add node features if needed later, complexity grows with heterogeneity
     )
+
+    dg = DGraph(dg_data)
+    return dg
 
 if __name__ == "__main__":
     # Test Verification
@@ -127,12 +131,12 @@ if __name__ == "__main__":
         print("Converting to DGData...")
         dg = from_relbench_heterodata(data)
         
-        print(f"DGData Edge Count: {dg.num_edges}")
+        assert dg.num_edge_events == 50
+        assert torch.all(dg.edge_time[:-1] <= dg.edge_time[1:])
+
+        print(f"DGData Edge Count: {dg.num_edge_events}")
         print(f"DGData Node Count: {dg.num_nodes}") # Inferred from max index usually
         print("Edge Time Sample:", dg.edge_time[:10])
-        
-        assert dg.num_edges == 50
-        assert dg.edge_time.is_sorted
         print("Verification Successful!")
         
     except ImportError:

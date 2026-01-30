@@ -3,7 +3,9 @@ import unittest
 import torch
 from torch_geometric.data import HeteroData
 from rdl_tgm import from_relbench_heterodata
-from tgm.data import DGData
+import pytest 
+from tgm.exceptions import EmptyGraphError
+
 
 class TestRDLTGM(unittest.TestCase):
     def setUp(self):
@@ -35,12 +37,12 @@ class TestRDLTGM(unittest.TestCase):
         dg = from_relbench_heterodata(self.data)
         
         expected_edges = 4 + 4 + 2 # 10 edges total
-        self.assertEqual(dg.num_edges, expected_edges)
+        self.assertEqual(dg.num_edge_events, expected_edges)
         
         # Total nodes = 5 (user) + 10 (product) + 20 (event) = 35
         # DGData infers num_nodes from max index in edge_index usually, or we might need to be careful if isolated nodes exist.
         # But let's check edges primarily.
-        self.assertEqual(dg.edge_index.size(1), expected_edges)
+        self.assertEqual(dg.edge_src.size(0), expected_edges)
 
     def test_timestamp_propagation(self):
         """Test if timestamps are correctly propagated from event nodes to edges."""
@@ -72,8 +74,10 @@ class TestRDLTGM(unittest.TestCase):
     def test_empty_graph(self):
         """Test conversion of an empty HeteroData object."""
         empty_data = HeteroData()
-        dg = from_relbench_heterodata(empty_data)
-        self.assertEqual(dg.num_edges, 0)
+        with pytest.raises(EmptyGraphError):
+            dg = from_relbench_heterodata(empty_data)
+
+        
 
 if __name__ == '__main__':
     unittest.main()
